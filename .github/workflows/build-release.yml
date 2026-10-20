@@ -1,0 +1,266 @@
+name: Build & publish release
+
+# Builds the Windows installers from the PRIVATE source repo
+# (Mudawy-clinic-org/mudawy-clinic) and publishes them here as the Latest
+# release. The landing page links permanently to
+#   releases/latest/download/mudawy-setup.zip
+# so publishing here is the whole release.
+#
+# Why it lives in this public repo: Actions minutes are free on public repos,
+# while the private repo's monthly minutes run out. The source is checked out
+# read-only with a deploy key and is never published — only the installers are.
+#
+#   1. Tag main on the private repo:  git tag v2026.10.20 && git push origin v2026.10.20
+#   2. Here: Actions -> "Build & publish release" -> Run workflow -> tag v2026.10.20
+#      (or: gh workflow run build-release.yml -R Mudawy-clinic-org/mudawy-releases -f tag=v2026.10.20)
+#
+# Secrets (this repo):
+#   SOURCE_DEPLOY_KEY  — private half of a READ-ONLY deploy key on mudawy-clinic
+#   ACTIVATION_SECRET  — offline activation-code secret (Supabase Vault
+#                        `activation_secret`); the release refuses to ship without it
+#
+# Run logs here are public: nothing below prints source or secrets, and the
+# obfuscation debug symbols are deliberately NOT uploaded (artifacts on a
+# public repo are downloadable by anyone).
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag on mudawy-clinic to build, e.g. v2026.10.20"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-release
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: Mudawy-clinic-org/mudawy-clinic
+  FLUTTER_VERSION: 3.38.5 # keep in sync with .fvmrc in the source repo
+
+jobs:
+  # Same gate as the source repo's CI (analyze + tests), so nothing ships that
+  # would have failed there.
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate tag
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          if ! [[ "$TAG" =~ ^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}(\.[0-9]+)?$ ]]; then
+            echo "Tag must look like v2026.10.20 or v2026.10.20.1, got: $TAG" >&2
+            exit 1
+          fi
+
+      - name: Check out source (read-only)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: refs/tags/${{ inputs.tag }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Install sqlite3
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Generate code (drift / json)
+        run: dart run build_runner build --force-jit
+
+      - name: Analyze
+        run: flutter analyze --no-fatal-infos
+
+      - name: Test
+        run: flutter test
+
+  build-and-publish:
+    needs: verify
+    # Pinned to 2022: the newer image's Visual Studio layout isn't detected by
+    # Flutter, which then fails to find Visual Studio.
+    runs-on: windows-2022
+    permissions:
+      contents: write # create the release in THIS repo
+    env:
+      TAG: ${{ inputs.tag }}
+    steps:
+      - name: Check out source (read-only)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: refs/tags/${{ inputs.tag }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Check activation secret
+        env:
+          ACTIVATION_SECRET: ${{ secrets.ACTIVATION_SECRET }}
+        run: |
+          if ([string]::IsNullOrEmpty($env:ACTIVATION_SECRET)) {
+            Write-Error "ACTIVATION_SECRET is not set on this repo; refusing to publish a release whose activation codes cannot work."
+            exit 1
+          }
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Enable Windows desktop
+        run: flutter config --enable-windows-desktop
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Generate code (drift / json)
+        run: dart run build_runner build --force-jit
+
+      - name: Read version from pubspec
+        id: ver
+        run: |
+          $line = (Select-String -Path pubspec.yaml -Pattern '^version:\s*(\S+)').Matches[0].Groups[1].Value
+          $version = $line.Split('+')[0]
+          Write-Host "App version: $version"
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      # --split-debug-info goes to RUNNER_TEMP, outside build\ and dist\, so the
+      # symbols can never be staged into an installer or zip.
+      - name: Build reception station
+        run: |
+          flutter build windows --release -t lib/main_reception.dart --obfuscate "--split-debug-info=$env:RUNNER_TEMP\debug-symbols\reception"
+          if ($LASTEXITCODE -ne 0) { throw "flutter build windows (reception) failed" }
+
+      - name: Stage reception build
+        run: |
+          New-Item -ItemType Directory -Force -Path dist\reception | Out-Null
+          Copy-Item -Path build\windows\x64\runner\Release\* -Destination dist\reception -Recurse -Force
+
+      # Only the doctor station redeems activation codes. The secret is never
+      # passed whole: a fresh random mask goes in as ACTIVATION_SECRET_A and
+      # secret XOR mask as ACTIVATION_SECRET_B, recombined at runtime by
+      # lib/core/security/activation_secret.dart.
+      - name: Build doctor station
+        env:
+          ACTIVATION_SECRET: ${{ secrets.ACTIVATION_SECRET }}
+        run: |
+          $secret = [System.Text.Encoding]::UTF8.GetBytes($env:ACTIVATION_SECRET)
+          $mask = New-Object byte[] $secret.Length
+          [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($mask)
+          $xored = New-Object byte[] $secret.Length
+          for ($i = 0; $i -lt $secret.Length; $i++) { $xored[$i] = $secret[$i] -bxor $mask[$i] }
+          $a = -join ($mask  | ForEach-Object { $_.ToString('x2') })
+          $b = -join ($xored | ForEach-Object { $_.ToString('x2') })
+          Write-Host "::add-mask::$a"
+          Write-Host "::add-mask::$b"
+          $defines = @("--dart-define=ACTIVATION_SECRET_A=$a", "--dart-define=ACTIVATION_SECRET_B=$b")
+          flutter build windows --release -t lib/main_doctor.dart --obfuscate "--split-debug-info=$env:RUNNER_TEMP\debug-symbols\doctor" @defines
+          if ($LASTEXITCODE -ne 0) { throw "flutter build windows (doctor) failed" }
+
+      - name: Stage doctor build
+        run: |
+          New-Item -ItemType Directory -Force -Path dist\doctor | Out-Null
+          Copy-Item -Path build\windows\x64\runner\Release\* -Destination dist\doctor -Recurse -Force
+
+      # Per-user (no-admin) installer, so ship the Visual C++ runtime DLLs
+      # app-local instead of running vc_redist.exe.
+      - name: Bundle Visual C++ runtime (app-local)
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -property installationPath
+          if (-not $vs) { throw "vswhere could not locate a Visual Studio install" }
+          $redistRoot = Join-Path $vs 'VC\Redist\MSVC'
+          $needed = @('vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll')
+          foreach ($name in $needed) {
+            $dll = Get-ChildItem -Path $redistRoot -Recurse -Filter $name -ErrorAction SilentlyContinue |
+                   Where-Object { $_.FullName -match '\\x64\\' } |
+                   Sort-Object FullName | Select-Object -Last 1
+            if (-not $dll) { throw "CRT DLL '$name' not found under $redistRoot" }
+            Copy-Item $dll.FullName -Destination dist\doctor    -Force
+            Copy-Item $dll.FullName -Destination dist\reception -Force
+          }
+          foreach ($station in @('doctor','reception')) {
+            foreach ($name in $needed) {
+              if (-not (Test-Path "dist\$station\$name")) { throw "Expected dist\$station\$name after bundling" }
+            }
+          }
+
+      - name: Build installers (Inno Setup)
+        run: |
+          choco install innosetup -y --no-progress
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          & $iscc "/DMyAppVersion=${{ steps.ver.outputs.version }}" "/DStation=doctor"    "/DSrcDir=dist\doctor"    installer\clinic.iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup (doctor) failed" }
+          & $iscc "/DMyAppVersion=${{ steps.ver.outputs.version }}" "/DStation=reception" "/DSrcDir=dist\reception" installer\clinic.iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup (reception) failed" }
+
+      - name: Stage setup guides
+        run: |
+          New-Item -ItemType Directory -Force -Path dist\guides | Out-Null
+          Copy-Item docs\before-install\hakeem_before_install_ar.png     dist\guides\ -Force
+          Copy-Item docs\direct-lan-setup\hakeem_direct_lan_setup_ar.png dist\guides\ -Force
+
+      # One zip with both installers + both Arabic guides: the single file the
+      # landing page links to. Fixed-name copies back the permanent links.
+      - name: Build combined download bundle
+        id: bundle
+        run: |
+          $version = "${{ steps.ver.outputs.version }}"
+          $date = Get-Date -Format 'yyyy.MM.dd'
+          New-Item -ItemType Directory -Force -Path dist\bundle | Out-Null
+          Copy-Item "installer\mudawy-doctor-setup-$version.exe"    dist\bundle\ -Force
+          Copy-Item "installer\mudawy-reception-setup-$version.exe" dist\bundle\ -Force
+          Copy-Item dist\guides\*.png dist\bundle\ -Force
+          $zip = "mudawy-$version-$date.zip"
+          Compress-Archive -Path dist\bundle\* -DestinationPath $zip -Force
+          New-Item -ItemType Directory -Force -Path dist\stable | Out-Null
+          Copy-Item $zip dist\stable\mudawy-setup.zip -Force
+          Copy-Item "installer\mudawy-doctor-setup-$version.exe"    dist\stable\mudawy-doctor-setup.exe    -Force
+          Copy-Item "installer\mudawy-reception-setup-$version.exe" dist\stable\mudawy-reception-setup.exe -Force
+          "zip=$zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Zip portable apps
+        run: |
+          Compress-Archive -Path dist\doctor\*    -DestinationPath mudawy-doctor-${{ steps.ver.outputs.version }}.zip
+          Compress-Archive -Path dist\reception\* -DestinationPath mudawy-reception-${{ steps.ver.outputs.version }}.zip
+
+      # --latest: the releases/latest/download/... links follow this release.
+      - name: Publish the release (Latest)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $v = "${{ steps.ver.outputs.version }}"
+          $assets = @(
+            "installer\mudawy-doctor-setup-$v.exe",
+            "installer\mudawy-reception-setup-$v.exe",
+            "dist\guides\hakeem_before_install_ar.png",
+            "dist\guides\hakeem_direct_lan_setup_ar.png",
+            "mudawy-doctor-$v.zip",
+            "mudawy-reception-$v.zip",
+            "${{ steps.bundle.outputs.zip }}",
+            "dist\stable\mudawy-setup.zip",
+            "dist\stable\mudawy-doctor-setup.exe",
+            "dist\stable\mudawy-reception-setup.exe"
+          )
+          foreach ($a in $assets) { if (-not (Test-Path $a)) { throw "Missing build output: $a" } }
+          $commit = (git rev-parse --short HEAD)
+          $notes = "Mudawy $env:TAG (app $v, source $commit). Download **mudawy-setup.zip** — both station installers and the Arabic setup guides."
+          gh release create $env:TAG $assets `
+            --repo "${{ github.repository }}" `
+            --title "Mudawy $env:TAG" `
+            --notes $notes `
+            --latest
+          if ($LASTEXITCODE -ne 0) { throw "gh release create $env:TAG failed" }
